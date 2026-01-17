@@ -1,0 +1,239 @@
+---
+# Ubuntu 24.04 + Kubernetes v1.35.0 + containerd
+# This playbook is intentionally self-contained and does NOT rely on the legacy roles.
+
+- name: Prepare all nodes (OS + containerd + Kubernetes packages)
+  hosts: kube-cluster
+  gather_facts: yes
+  become: yes
+  vars:
+    k8s_repo_url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_minor_repo }}/deb/"
+    k8s_repo_key_url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_minor_repo }}/deb/Release.key"
+    k8s_version_v: "v{{ k8s_version }}"
+  tasks:
+    - name: Ensure required base packages are installed
+      apt:
+        update_cache: yes
+        name:
+          - ca-certificates
+          - curl
+          - gpg
+          - apt-transport-https
+          - conntrack
+          - socat
+          - ebtables
+          - iptables
+          - ipset
+        state: present
+
+    - name: Disable swap (runtime)
+      command: swapoff -a
+      changed_when: false
+      failed_when: false
+
+    - name: Disable swap in /etc/fstab (persist)
+      lineinfile:
+        path: /etc/fstab
+        regexp: '(?i)^([^#].*\s+swap\s+swap\s+.*)$'
+        line: '# \\1'
+        backrefs: yes
+
+    - name: Ensure kernel modules are loaded at boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Load kernel modules now
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Set sysctl params for Kubernetes networking
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Apply sysctl params
+      command: sysctl --system
+      changed_when: false
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate default containerd config if missing
+      shell: "containerd config default > /etc/containerd/config.toml"
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Ensure containerd uses systemd cgroups
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*SystemdCgroup\s*=\s*false\s*$'
+        replace: '            SystemdCgroup = true'
+
+    - name: Enable and restart containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: restarted
+
+    - name: Ensure /etc/apt/keyrings exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install Kubernetes apt repo key (pkgs.k8s.io)
+      shell: "curl -fsSL {{ k8s_repo_key_url }} | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repo list (pkgs.k8s.io)
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] {{ k8s_repo_url }} /\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Apt update after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Resolve apt package versions matching {{ k8s_version }}
+      shell: |
+        set -e
+        kubeadm_ver=$(apt-cache madison kubeadm | awk '$3 ~ /^{{ k8s_version }}-/ {print $3; exit}')
+        kubelet_ver=$(apt-cache madison kubelet | awk '$3 ~ /^{{ k8s_version }}-/ {print $3; exit}')
+        kubectl_ver=$(apt-cache madison kubectl | awk '$3 ~ /^{{ k8s_version }}-/ {print $3; exit}')
+        echo "kubeadm=${kubeadm_ver}"
+        echo "kubelet=${kubelet_ver}"
+        echo "kubectl=${kubectl_ver}"
+      register: k8s_pkg_versions
+      changed_when: false
+
+    - name: Parse resolved versions
+      set_fact:
+        kubeadm_apt_version: "{{ (k8s_pkg_versions.stdout_lines | select('match','^kubeadm=') | list | first).split('=',2)[1] | default('') }}"
+        kubelet_apt_version: "{{ (k8s_pkg_versions.stdout_lines | select('match','^kubelet=') | list | first).split('=',2)[1] | default('') }}"
+        kubectl_apt_version: "{{ (k8s_pkg_versions.stdout_lines | select('match','^kubectl=') | list | first).split('=',2)[1] | default('') }}"
+
+    - name: Fail if required Kubernetes 1.35.0 packages are not found
+      fail:
+        msg: |
+          Không tìm thấy package version phù hợp với {{ k8s_version }} trong repo {{ k8s_repo_url }}.
+          Hãy SSH vào node và chạy: apt-cache madison kubeadm
+          Sau đó kiểm tra lại k8s_minor_repo/k8s_version trong inventory vars.
+      when:
+        - kubeadm_apt_version | length == 0 or kubelet_apt_version | length == 0 or kubectl_apt_version | length == 0
+
+    - name: Install kubelet/kubeadm/kubectl pinned to {{ k8s_version }}
+      apt:
+        name:
+          - "kubelet={{ kubelet_apt_version }}"
+          - "kubeadm={{ kubeadm_apt_version }}"
+          - "kubectl={{ kubectl_apt_version }}"
+        state: present
+
+    - name: Hold Kubernetes packages
+      command: "apt-mark hold kubelet kubeadm kubectl"
+      changed_when: false
+
+    - name: Enable kubelet (will crashloop until kubeadm init/join)
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+- name: Initialize control-plane (master)
+  hosts: master
+  gather_facts: yes
+  become: yes
+  vars:
+    k8s_version_v: "v{{ k8s_version }}"
+  tasks:
+    - name: Check if control-plane already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Determine apiserver advertise address
+      set_fact:
+        apiserver_advertise_address: "{{ (k8s_apiserver_advertise_address | trim) if (k8s_apiserver_advertise_address | trim | length > 0) else ansible_default_ipv4.address }}"
+
+    - name: Pre-pull images
+      command: "kubeadm config images pull --kubernetes-version {{ k8s_version_v }} --cri-socket {{ cri_socket }}"
+      when: not admin_conf.stat.exists
+
+    - name: kubeadm init
+      command: >-
+        kubeadm init
+        --kubernetes-version {{ k8s_version_v }}
+        --apiserver-advertise-address {{ apiserver_advertise_address }}
+        --service-cidr {{ service_cidr }}
+        --pod-network-cidr {{ pod_network_cidr }}
+        --cri-socket {{ cri_socket }}
+      when: not admin_conf.stat.exists
+
+    - name: Configure kubectl for root
+      shell: |
+        mkdir -p /root/.kube
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+      args:
+        creates: /root/.kube/config
+
+    - name: Install Calico CNI
+      command: "kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml"
+      register: calico_apply
+      retries: 10
+      delay: 6
+      until: calico_apply.rc == 0
+
+    - name: Get join command
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Publish join command to all hosts
+      set_fact:
+        kubeadm_join_command: "{{ join_cmd.stdout }}"
+
+- name: Join workers
+  hosts: node
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Check if node already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join node to cluster
+      command: "{{ hostvars[groups['master'][0]].kubeadm_join_command }} --cri-socket {{ cri_socket }}"
+      when: not kubelet_conf.stat.exists

@@ -1,0 +1,21 @@
+# Inventory-scoped vars for Vultr Ubuntu 24.04 + Kubernetes v1.35.0 (containerd)
+
+# Kubernetes
+k8s_version: "1.35.0"
+# Minor repo selector for pkgs.k8s.io (v1.35 contains patch versions 1.35.x)
+k8s_minor_repo: "v1.35"
+
+# Networking
+service_cidr: "10.96.0.0/12"
+# Calico default is 192.168.0.0/16; keep it consistent with the manifest.
+pod_network_cidr: "192.168.0.0/16"
+
+# CNI
+calico_version: "v3.28.0"
+
+# Runtime
+cri_socket: "unix:///var/run/containerd/containerd.sock"
+
+# Optional: force advertise address for kube-apiserver.
+# Leave empty to auto-use ansible_default_ipv4.address on the master.
+k8s_apiserver_advertise_address: ""
